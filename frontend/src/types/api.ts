@@ -24,6 +24,7 @@ export interface AdminAccount {
   remaining_display: string
   is_available: boolean
   error_count: number
+  failure_count: number
   disabled: boolean
   cooldown_seconds: number
   cooldown_reason: string | null
@@ -191,6 +192,8 @@ export interface AdminStats {
   failed_accounts: number
   rate_limited_accounts: number
   idle_accounts: number
+  success_count?: number
+  failed_count?: number
   trend: AdminStatsTrend
 }
 

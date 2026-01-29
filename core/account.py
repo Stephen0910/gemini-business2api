@@ -123,7 +123,8 @@ class AccountManager:
         self.last_cooldown_time = 0.0  # 冷却时间戳（401/403/429错误）
         self.quota_cooldowns: Dict[str, float] = {}  # 按配额类型的冷却时间戳 {"text": timestamp, "images": timestamp, "videos": timestamp}
         self.error_count = 0
-        self.conversation_count = 0  # 累计对话次数（用于统计展示）
+        self.conversation_count = 0  # 累计成功次数（用于统计展示）
+        self.failure_count = 0  # 累计失败次数（用于统计展示）
         self.session_usage_count = 0  # 本次启动后使用次数（用于均衡轮询）
 
     def handle_non_http_error(self, error_context: str = "", request_id: str = "") -> None:
@@ -464,6 +465,8 @@ class MultiAccountManager:
         # 从统计数据加载对话次数
         if "account_conversations" in global_stats:
             manager.conversation_count = global_stats["account_conversations"].get(config.account_id, 0)
+        if "account_failures" in global_stats:
+            manager.failure_count = global_stats["account_failures"].get(config.account_id, 0)
         self.accounts[config.account_id] = manager
         self.account_list.append(config.account_id)
         logger.info(f"[MULTI] [ACCOUNT] 添加账户: {config.account_id}")
@@ -632,7 +635,8 @@ def reload_accounts(
     old_stats = {}
     for account_id, account_mgr in multi_account_mgr.accounts.items():
         old_stats[account_id] = {
-            "conversation_count": account_mgr.conversation_count
+            "conversation_count": account_mgr.conversation_count,
+            "failure_count": account_mgr.failure_count
         }
 
     # 清空会话缓存并重新加载配置
@@ -651,6 +655,7 @@ def reload_accounts(
         if account_id in new_mgr.accounts:
             account_mgr = new_mgr.accounts[account_id]
             account_mgr.conversation_count = stats["conversation_count"]
+            account_mgr.failure_count = stats.get("failure_count", 0)
             # 确保错误状态已重置（虽然load_multi_account_config已经初始化，但显式确认）
             account_mgr.is_available = True
             account_mgr.last_error_time = 0.0

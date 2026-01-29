@@ -106,12 +106,15 @@ async def load_stats():
         data = {
             "total_visitors": 0,
             "total_requests": 0,
+            "success_count": 0,
+            "failed_count": 0,
             "request_timestamps": [],
             "model_request_timestamps": {},
             "failure_timestamps": [],
             "rate_limit_timestamps": [],
             "visitor_ips": {},
             "account_conversations": {},
+            "account_failures": {},
             "recent_conversations": []
         }
 
@@ -147,12 +150,15 @@ async def save_stats(stats):
 global_stats = {
     "total_visitors": 0,
     "total_requests": 0,
+    "success_count": 0,
+    "failed_count": 0,
     "request_timestamps": deque(maxlen=20000),
     "model_request_timestamps": {},
     "failure_timestamps": deque(maxlen=10000),
     "rate_limit_timestamps": deque(maxlen=10000),
     "visitor_ips": {},
     "account_conversations": {},
+    "account_failures": {},
     "recent_conversations": []
 }
 
@@ -744,8 +750,16 @@ async def startup_event():
     global_stats.setdefault("failure_timestamps", [])
     global_stats.setdefault("rate_limit_timestamps", [])
     global_stats.setdefault("recent_conversations", [])
+    global_stats.setdefault("success_count", 0)
+    global_stats.setdefault("failed_count", 0)
+    global_stats.setdefault("account_conversations", {})
+    global_stats.setdefault("account_failures", {})
     uptime_tracker.configure_storage(os.path.join(DATA_DIR, "uptime.json"))
     uptime_tracker.load_heartbeats()
+    for account_id, account_mgr in multi_account_mgr.accounts.items():
+        account_mgr.conversation_count = global_stats["account_conversations"].get(account_id, 0)
+        account_mgr.failure_count = global_stats["account_failures"].get(account_id, 0)
+    logger.info("[SYSTEM] 已恢复账户成功/失败统计")
     logger.info(f"[SYSTEM] 统计数据已加载: {global_stats['total_requests']} 次请求, {global_stats['total_visitors']} 位访客")
 
     # 启动缓存清理任务
@@ -1075,6 +1089,8 @@ async def admin_stats(request: Request):
         global_stats.setdefault("failure_timestamps", deque(maxlen=10000))
         global_stats.setdefault("rate_limit_timestamps", deque(maxlen=10000))
         global_stats.setdefault("model_request_timestamps", {})
+        global_stats.setdefault("success_count", 0)
+        global_stats.setdefault("failed_count", 0)
 
         # 清理过期数据，保持 deque 类型
         cleaned_request_ts = [ts for ts in global_stats["request_timestamps"] if now - ts < window_seconds]
@@ -1113,6 +1129,8 @@ async def admin_stats(request: Request):
         "failed_accounts": failed_accounts,
         "rate_limited_accounts": rate_limited_accounts,
         "idle_accounts": idle_accounts,
+        "success_count": global_stats.get("success_count", 0),
+        "failed_count": global_stats.get("failed_count", 0),
         "trend": {
             "labels": labels,
             "total_requests": bucketize(request_timestamps),
@@ -1142,6 +1160,7 @@ async def admin_get_accounts(request: Request):
             "remaining_display": remaining_display,
             "is_available": account_manager.is_available,
             "error_count": account_manager.error_count,
+            "failure_count": account_manager.failure_count,
             "disabled": config.disabled,
             "cooldown_seconds": cooldown_seconds,
             "cooldown_reason": cooldown_reason,
@@ -1771,6 +1790,7 @@ async def chat_impl(
     message_count = len(req.messages)
 
     monitor_recorded = False
+    account_manager: Optional[AccountManager] = None
 
     async def finalize_result(
         status: str,
@@ -1805,11 +1825,34 @@ async def chat_impl(
             global_stats.setdefault("failure_timestamps", [])
             global_stats.setdefault("rate_limit_timestamps", [])
             global_stats.setdefault("recent_conversations", [])
+            global_stats.setdefault("success_count", 0)
+            global_stats.setdefault("failed_count", 0)
+            global_stats.setdefault("account_conversations", {})
+            global_stats.setdefault("account_failures", {})
             if status != "success":
+                global_stats["failed_count"] += 1
+                global_stats["failure_timestamps"].append(time.time())
                 if status_code == 429:
                     global_stats["rate_limit_timestamps"].append(time.time())
+                failure_account_id = None
+                if account_manager:
+                    account_manager.failure_count += 1
+                    failure_account_id = account_manager.config.account_id
+                    global_stats["account_failures"][failure_account_id] = account_manager.failure_count
                 else:
-                    global_stats["failure_timestamps"].append(time.time())
+                    failure_account_id = getattr(request.state, "last_account_id", None)
+                    if failure_account_id and failure_account_id in multi_account_mgr.accounts:
+                        account_mgr = multi_account_mgr.accounts[failure_account_id]
+                        account_mgr.failure_count += 1
+                        global_stats["account_failures"][failure_account_id] = account_mgr.failure_count
+                    elif failure_account_id:
+                        global_stats["account_failures"][failure_account_id] = (
+                            global_stats["account_failures"].get(failure_account_id, 0) + 1
+                        )
+            else:
+                global_stats["success_count"] += 1
+                if account_manager:
+                    global_stats["account_conversations"][account_manager.config.account_id] = account_manager.conversation_count
             global_stats["recent_conversations"].append(entry)
             global_stats["recent_conversations"] = global_stats["recent_conversations"][-60:]
             await save_stats(global_stats)
@@ -1866,6 +1909,7 @@ async def chat_impl(
             account_manager = await multi_account_mgr.get_account(account_id, request_id)
             google_session = cached_session["session_id"]
             is_new_conversation = False
+            request.state.last_account_id = account_manager.config.account_id
             logger.info(f"[CHAT] [{account_id}] [req_{request_id}] 继续会话: {google_session[-12:]}")
         else:
             # 新对话：轮询选择可用账户，失败时尝试其他账户
@@ -1883,6 +1927,7 @@ async def chat_impl(
                         google_session
                     )
                     is_new_conversation = True
+                    request.state.last_account_id = account_manager.config.account_id
                     logger.info(f"[CHAT] [{account_manager.config.account_id}] [req_{request_id}] 新会话创建并绑定账户")
                     # 记录账号池状态（账户可用）
                     uptime_tracker.record_request("account_pool", True)
@@ -2011,21 +2056,19 @@ async def chat_impl(
                 ):
                     yield chunk
 
+                if getattr(request.state, "first_response_time", None) is None:
+                    account_manager.handle_non_http_error("空响应", request_id)
+                    uptime_tracker.record_request("account_pool", False, status_code=502)
+                    await finalize_result("error", 502, "Empty response")
+                    return
+
                 # 请求成功，重置账户失败计数
                 account_manager.is_available = True
                 account_manager.error_count = 0
-                account_manager.conversation_count += 1  # 增加对话次数
+                account_manager.conversation_count += 1  # 增加成功次数
 
                 # 记录账号池状态（请求成功）
                 uptime_tracker.record_request("account_pool", True)
-
-                # 保存对话次数到统计数据
-                async with stats_lock:
-                    if "account_conversations" not in global_stats:
-                        global_stats["account_conversations"] = {}
-                    global_stats["account_conversations"][account_manager.config.account_id] = account_manager.conversation_count
-                    await save_stats(global_stats)
-
                 await finalize_result("success", 200, None)
 
                 break
@@ -2109,6 +2152,7 @@ async def chat_impl(
 
                         # 更新账户管理器
                         account_manager = new_account
+                        request.state.last_account_id = account_manager.config.account_id
 
                         # 设置重试模式（发送完整上下文）
                         current_retry_mode = True
@@ -2296,11 +2340,17 @@ async def stream_chat_generator(session: str, text_content: str, file_ids: List[
                     # 区分思考过程和正常内容
                     if content_obj.get("thought"):
                         # 思考过程使用 reasoning_content 字段（类似 OpenAI o1）
+                        if first_response_time is None:
+                            first_response_time = time.time()
+                            if request is not None:
+                                request.state.first_response_time = first_response_time
                         chunk = create_chunk(chat_id, created_time, model_name, {"reasoning_content": text}, None)
                         yield f"data: {chunk}\n\n"
                     else:
                         if first_response_time is None:
                             first_response_time = time.time()
+                            if request is not None:
+                                request.state.first_response_time = first_response_time
                         # 正常内容使用 content 字段
                         full_content += text
                         chunk = create_chunk(chat_id, created_time, model_name, {"content": text}, None)
@@ -2350,6 +2400,10 @@ async def stream_chat_generator(session: str, text_content: str, file_ids: List[
                     logger.error(f"[IMAGE] [{account_manager.config.account_id}] [req_{request_id}] 图片{idx}下载失败: {type(result).__name__}: {str(result)[:100]}")
                     # 降级处理：返回错误提示而不是静默失败
                     error_msg = f"\n\n⚠️ 图片 {idx} 下载失败\n\n"
+                    if first_response_time is None:
+                        first_response_time = time.time()
+                        if request is not None:
+                            request.state.first_response_time = first_response_time
                     chunk = create_chunk(chat_id, created_time, model_name, {"content": error_msg}, None)
                     yield f"data: {chunk}\n\n"
                     continue
@@ -2357,11 +2411,19 @@ async def stream_chat_generator(session: str, text_content: str, file_ids: List[
                 try:
                     markdown = process_media(result, mime, chat_id, fid, base_url, idx, request_id, account_manager.config.account_id)
                     success_count += 1
+                    if first_response_time is None:
+                        first_response_time = time.time()
+                        if request is not None:
+                            request.state.first_response_time = first_response_time
                     chunk = create_chunk(chat_id, created_time, model_name, {"content": markdown}, None)
                     yield f"data: {chunk}\n\n"
                 except Exception as save_error:
                     logger.error(f"[MEDIA] [{account_manager.config.account_id}] [req_{request_id}] 媒体{idx}处理失败: {str(save_error)[:100]}")
                     error_msg = f"\n\n⚠️ 媒体 {idx} 处理失败\n\n"
+                    if first_response_time is None:
+                        first_response_time = time.time()
+                        if request is not None:
+                            request.state.first_response_time = first_response_time
                     chunk = create_chunk(chat_id, created_time, model_name, {"content": error_msg}, None)
                     yield f"data: {chunk}\n\n"
 
@@ -2371,6 +2433,10 @@ async def stream_chat_generator(session: str, text_content: str, file_ids: List[
             logger.error(f"[IMAGE] [{account_manager.config.account_id}] [req_{request_id}] 图片处理失败: {type(e).__name__}: {str(e)[:100]}")
             # 降级处理：通知用户图片处理失败
             error_msg = f"\n\n⚠️ 图片处理失败: {type(e).__name__}\n\n"
+            if first_response_time is None:
+                first_response_time = time.time()
+                if request is not None:
+                    request.state.first_response_time = first_response_time
             chunk = create_chunk(chat_id, created_time, model_name, {"content": error_msg}, None)
             yield f"data: {chunk}\n\n"
 

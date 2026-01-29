@@ -283,10 +283,10 @@
             </div>
             <div>
               <p>失败数</p>
-              <p class="mt-1 text-sm font-semibold text-foreground">{{ account.error_count }}</p>
+              <p class="mt-1 text-sm font-semibold text-foreground">{{ account.failure_count }}</p>
             </div>
             <div>
-              <p>会话数</p>
+              <p>成功数</p>
               <p class="mt-1 text-sm font-semibold text-foreground">{{ account.conversation_count }}</p>
             </div>
           </div>
@@ -350,7 +350,7 @@
               <th class="py-3 pr-6">配额</th>
               <th class="py-3 pr-6">冷却</th>
               <th class="py-3 pr-6">失败数</th>
-              <th class="py-3 pr-6">会话数</th>
+              <th class="py-3 pr-6">成功数</th>
               <th class="py-3 text-right">操作</th>
             </tr>
           </thead>
@@ -405,7 +405,7 @@
                 </span>
               </td>
               <td class="py-4 pr-6 text-xs text-muted-foreground">
-                {{ account.error_count }}
+                {{ account.failure_count }}
               </td>
               <td class="py-4 pr-6 text-xs text-muted-foreground">
                 {{ account.conversation_count }}
